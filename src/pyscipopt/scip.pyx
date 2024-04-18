@@ -1,6 +1,7 @@
 ##@file scip.pyx
 #@brief holding functions in python that reference the SCIP public functions included in scip.pxd
 import weakref
+from os import path as osp
 from os.path import abspath
 from os.path import splitext
 import sys
@@ -341,6 +342,10 @@ cdef class Column:
     def getUb(self):
         """gets upper bound of column"""
         return SCIPcolGetUb(self.scip_col)
+
+    def getIndex(self):
+        return SCIPcolGetIndex(self.scip_col)
+
 
 cdef class Row:
     """Base class holding a pointer to corresponding SCIP_ROW"""
@@ -2973,6 +2978,26 @@ cdef class Model:
         branchrule.model = <Model>weakref.proxy(self)
         Py_INCREF(branchrule)
 
+    def includeBranchSymbSo(self, so_path):
+        assert(osp.exists(so_path))
+        PY_SCIP_CALL(SCIPincludeBranchruleSymb(self._scip, so_path.encode('utf-8')))
+
+    def getSymbBestCands(self):
+        cdef SCIP_VAR** cands
+        cdef int ncands
+
+        cdef SCIP_BRANCHRULE*  branchrule
+        branchrule = SCIPfindBranchrule(self._scip, "symb")
+        if branchrule == NULL:
+            raise Exception("Error, branching rule not found!")
+
+        PY_SCIP_CALL(getSymbBestCands(self._scip, branchrule, &cands, &ncands))
+        assert( (ncands > 0 and cands != NULL)) # or (ncands == 0 and cands == NULL))
+        cands_list = [Variable.create(cands[i]) for i in range(ncands)]
+        free(cands)
+
+        return cands_list
+
     def getChildren(self):
         cdef SCIP_NODE** children
         cdef int nchildren
@@ -4200,6 +4225,134 @@ cdef class Model:
             },
         }
 
+    def getStateFast(self, prev_state = None):
+        cdef SCIP* scip = self._scip
+        cdef int i, j, k, col_i
+        cdef SCIP_Real sim, prod
+
+        update = prev_state is not None
+
+        # COLUMNS
+        cdef SCIP_COL** cols = SCIPgetLPCols(scip)
+        cdef int ncols = SCIPgetNLPCols(scip)
+
+        cdef np.ndarray[np.int32_t,   ndim=1] col_types
+        cdef np.ndarray[np.float32_t, ndim=1] col_coefs
+        cdef np.ndarray[np.float32_t, ndim=1] col_lbs
+        cdef np.ndarray[np.float32_t, ndim=1] col_ubs
+        cdef np.ndarray[np.int32_t,   ndim=1] col_basestats
+        cdef np.ndarray[np.float32_t, ndim=1] col_redcosts
+        cdef np.ndarray[np.int32_t,   ndim=1] col_ages
+        cdef np.ndarray[np.float32_t, ndim=1] col_solvals
+        cdef np.ndarray[np.float32_t, ndim=1] col_solfracs
+        cdef np.ndarray[np.int32_t,   ndim=1] col_sol_is_at_lb
+        cdef np.ndarray[np.int32_t,   ndim=1] col_sol_is_at_ub
+        cdef np.ndarray[np.float32_t, ndim=1] col_incvals
+        cdef np.ndarray[np.float32_t, ndim=1] col_avgincvals
+
+        if not update:
+            col_types        = np.empty(shape=(ncols, ), dtype=np.int32)
+            col_coefs        = np.empty(shape=(ncols, ), dtype=np.float32)
+            col_lbs          = np.empty(shape=(ncols, ), dtype=np.float32)
+            col_ubs          = np.empty(shape=(ncols, ), dtype=np.float32)
+            col_basestats    = np.empty(shape=(ncols, ), dtype=np.int32)
+            col_redcosts     = np.empty(shape=(ncols, ), dtype=np.float32)
+            col_ages         = np.empty(shape=(ncols, ), dtype=np.int32)
+            col_solvals      = np.empty(shape=(ncols, ), dtype=np.float32)
+            col_solfracs     = np.empty(shape=(ncols, ), dtype=np.float32)
+            col_sol_is_at_lb = np.empty(shape=(ncols, ), dtype=np.int32)
+            col_sol_is_at_ub = np.empty(shape=(ncols, ), dtype=np.int32)
+            col_incvals      = np.empty(shape=(ncols, ), dtype=np.float32)
+            col_avgincvals   = np.empty(shape=(ncols, ), dtype=np.float32)
+        else:
+            col_types        = prev_state['col']['types']
+            col_coefs        = prev_state['col']['coefs']
+            col_lbs          = prev_state['col']['lbs']
+            col_ubs          = prev_state['col']['ubs']
+            col_basestats    = prev_state['col']['basestats']
+            col_redcosts     = prev_state['col']['redcosts']
+            col_ages         = prev_state['col']['ages']
+            col_solvals      = prev_state['col']['solvals']
+            col_solfracs     = prev_state['col']['solfracs']
+            col_sol_is_at_lb = prev_state['col']['sol_is_at_lb']
+            col_sol_is_at_ub = prev_state['col']['sol_is_at_ub']
+            col_incvals      = prev_state['col']['incvals']
+            col_avgincvals   = prev_state['col']['avgincvals']
+
+        cdef SCIP_SOL* sol = SCIPgetBestSol(scip)
+        cdef SCIP_VAR* var
+        cdef SCIP_Real lb, ub, solval
+        for i in range(ncols):
+            col_i = SCIPcolGetLPPos(cols[i])
+            var = SCIPcolGetVar(cols[i])
+
+            lb = SCIPcolGetLb(cols[i])
+            ub = SCIPcolGetUb(cols[i])
+            solval = SCIPcolGetPrimsol(cols[i])
+
+            if not update:
+                # Variable type
+                col_types[col_i] = SCIPvarGetType(var)
+
+                # Objective coefficient
+                col_coefs[col_i] = SCIPcolGetObj(cols[i])
+
+            # Lower bound
+            if SCIPisInfinity(scip, REALABS(lb)):
+                col_lbs[col_i] = NAN
+            else:
+                col_lbs[col_i] = lb
+
+            # Upper bound
+            if SCIPisInfinity(scip, REALABS(ub)):
+                col_ubs[col_i] = NAN
+            else:
+                col_ubs[col_i] = ub
+
+            # Basis status
+            col_basestats[col_i] = SCIPcolGetBasisStatus(cols[i])
+
+            # Reduced cost
+            col_redcosts[col_i] = SCIPgetColRedcost(scip, cols[i])
+
+            # Age
+            col_ages[col_i] = cols[i].age
+
+            # LP solution value
+            col_solvals[col_i] = solval
+            col_solfracs[col_i] = SCIPfeasFrac(scip, solval)
+            col_sol_is_at_lb[col_i] = SCIPisEQ(scip, solval, lb)
+            col_sol_is_at_ub[col_i] = SCIPisEQ(scip, solval, ub)
+
+            # Incumbent solution value
+            if sol is NULL:
+                col_incvals[col_i] = NAN
+                col_avgincvals[col_i] = NAN
+            else:
+                col_incvals[col_i] = SCIPgetSolVal(scip, sol, var)
+                col_avgincvals[col_i] = SCIPvarGetAvgSol(var)
+
+        return {
+            'col': {
+                'types':        col_types,
+                'coefs':        col_coefs,
+                'lbs':          col_lbs,
+                'ubs':          col_ubs,
+                'basestats':    col_basestats,
+                'redcosts':     col_redcosts,
+                'ages':         col_ages,
+                'solvals':      col_solvals,
+                'solfracs':     col_solfracs,
+                'sol_is_at_lb': col_sol_is_at_lb,
+                'sol_is_at_ub': col_sol_is_at_ub,
+                'incvals':      col_incvals,
+                'avgincvals':   col_avgincvals,
+            },
+            'stats': {
+                'nlps': SCIPgetNLPs(scip),
+            },
+        }
+
     def getKhalilState(self, root_info, candidates):
         cdef SCIP* scip = self._scip
 
@@ -4417,6 +4570,7 @@ cdef class Model:
                         cdeg_min = cdeg if neighbor_index == 0 else min(cdeg_min, cdeg)
                     cdeg_mean /= nb_neighbors
                     for neighbor_index in range(nb_neighbors):
+                        cdeg = SCIProwGetNNonz(neighbors[neighbor_index])
                         cdeg_var += (cdeg - cdeg_mean)**2
                     cdeg_var /= nb_neighbors
                 root_info['col']['root_cdeg_mean'][col_i] = cdeg_mean
@@ -4434,7 +4588,7 @@ cdef class Model:
                     coef = nonzero_coefs_raw[neighbor_index]
                     if coef > 0:
                         pcoefs_count += 1
-                        pcoefs_mean = coef
+                        pcoefs_mean += coef
                         pcoefs_min = coef if pcoefs_count == 1 else min(pcoefs_min, coef)
                         pcoefs_max = coef if pcoefs_count == 1 else max(pcoefs_max, coef)
                     if coef < 0:
@@ -4641,6 +4795,7 @@ cdef class Model:
         cdef int row_index
         cdef int nrows = SCIPgetNLPRows(scip)
         cdef SCIP_ROW** rows = SCIPgetLPRows(scip)
+        cdef SCIP_ROW* row
         cdef float constraint_sum, abs_coef
         cdef SCIP_COL** neighbor_columns
         cdef int neighbor_var_index, candidate_index
@@ -4872,6 +5027,288 @@ cdef class Model:
             'acons_nb4':            cand_acons_nb4,
         }
 
+
+    def getKhalilStateFast(self, root_info, candidates):
+        cdef SCIP* scip = self._scip
+
+        cdef np.ndarray[np.float32_t, ndim=1] cand_coefs
+        cdef np.ndarray[np.float32_t, ndim=1] cand_coefs_pos
+        cdef np.ndarray[np.float32_t, ndim=1] cand_coefs_neg
+        cdef np.ndarray[np.int32_t, ndim=1]   cand_nnzrs
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_cdeg_mean
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_cdeg_var
+        cdef np.ndarray[np.int32_t, ndim=1]   cand_root_cdeg_min
+        cdef np.ndarray[np.int32_t, ndim=1]   cand_root_cdeg_max
+        cdef np.ndarray[np.int32_t, ndim=1]   cand_root_pcoefs_count
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_pcoefs_mean
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_pcoefs_var
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_pcoefs_min
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_pcoefs_max
+        cdef np.ndarray[np.int32_t, ndim=1]   cand_root_ncoefs_count
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_ncoefs_mean
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_ncoefs_var
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_ncoefs_min
+        cdef np.ndarray[np.float32_t, ndim=1] cand_root_ncoefs_max
+        cdef np.ndarray[np.float32_t, ndim=1] cand_slack
+        cdef np.ndarray[np.float32_t, ndim=1] cand_ps_up
+        cdef np.ndarray[np.float32_t, ndim=1] cand_ps_down
+        cdef np.ndarray[np.float32_t, ndim=1] cand_ps_ratio
+        cdef np.ndarray[np.float32_t, ndim=1] cand_ps_sum
+        cdef np.ndarray[np.float32_t, ndim=1] cand_ps_product
+        cdef np.ndarray[np.float32_t, ndim=1] cand_nb_up_infeas
+        cdef np.ndarray[np.float32_t, ndim=1] cand_nb_down_infeas
+
+
+        cdef int ncands = len(candidates)
+
+        cand_coefs               = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_coefs_pos           = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_coefs_neg           = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_nnzrs               = np.empty(shape=(ncands, ), dtype=np.int32)
+        cand_root_cdeg_mean      = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_cdeg_var       = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_cdeg_min       = np.empty(shape=(ncands, ), dtype=np.int32)
+        cand_root_cdeg_max       = np.empty(shape=(ncands, ), dtype=np.int32)
+        cand_root_pcoefs_count   = np.empty(shape=(ncands, ), dtype=np.int32)
+        cand_root_pcoefs_var     = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_pcoefs_mean    = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_pcoefs_min     = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_pcoefs_max     = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_ncoefs_count   = np.empty(shape=(ncands, ), dtype=np.int32)
+        cand_root_ncoefs_mean    = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_ncoefs_var     = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_ncoefs_min     = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_root_ncoefs_max     = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_solfracs            = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_slack               = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_ps_up               = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_ps_down             = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_ps_ratio            = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_ps_sum              = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_ps_product          = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_frac_up_infeas      = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_frac_down_infeas    = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_nb_up_infeas        = np.empty(shape=(ncands, ), dtype=np.float32)
+        cand_nb_down_infeas      = np.empty(shape=(ncands, ), dtype=np.float32)
+
+
+        cdef SCIP_COL** cols = SCIPgetLPCols(scip)
+        cdef int ncols = SCIPgetNLPCols(scip)
+        cdef int i, cand_i, col_i
+
+        # Static
+        # ------
+        cdef SCIP_ROW** neighbors
+        cdef SCIP_Real* nonzero_coefs_raw
+        cdef SCIP_Real coef
+        cdef SCIP_VAR* var
+        cdef SCIP_COL* col
+        cdef int neighbor_index, cdeg_max, cdeg_min, cdeg, nb_neighbors
+        cdef float cdeg_mean, cdeg_var
+        cdef int pcoefs_count, ncoefs_count
+        cdef float pcoefs_var, pcoefs_mean, pcoefs_min, pcoefs_max
+        cdef float ncoefs_var, ncoefs_mean, ncoefs_min, ncoefs_max
+
+        # if at root node, extract root information
+        if SCIPgetNNodes(scip) == 1:
+            root_info['col'] = {}
+            root_info['col']['coefs']               = {}
+            root_info['col']['coefs_pos']           = {}
+            root_info['col']['coefs_neg']           = {}
+            root_info['col']['nnzrs']               = {}
+            root_info['col']['root_cdeg_mean']      = {}
+            root_info['col']['root_cdeg_var']       = {}
+            root_info['col']['root_cdeg_min']       = {}
+            root_info['col']['root_cdeg_max']       = {}
+            root_info['col']['root_pcoefs_count']   = {}
+            root_info['col']['root_pcoefs_var']     = {}
+            root_info['col']['root_pcoefs_mean']    = {}
+            root_info['col']['root_pcoefs_min']     = {}
+            root_info['col']['root_pcoefs_max']     = {}
+            root_info['col']['root_ncoefs_count']   = {}
+            root_info['col']['root_ncoefs_mean']    = {}
+            root_info['col']['root_ncoefs_var']     = {}
+            root_info['col']['root_ncoefs_min']     = {}
+            root_info['col']['root_ncoefs_max']     = {}
+            for i in range(ncols):
+                col = cols[i]
+                col_i = SCIPcolGetIndex(col)
+                neighbors = SCIPcolGetRows(col)
+                nb_neighbors = SCIPcolGetNNonz(col)
+                nonzero_coefs_raw = SCIPcolGetVals(col)
+
+                # Objective function coeffs. (3)
+                #   Value of the coefficient (raw, positive only, negative only)
+                root_info['col']['coefs'][col_i]     = SCIPcolGetObj(col)
+                root_info['col']['coefs_pos'][col_i] = max(root_info['col']['coefs'][col_i], 0)
+                root_info['col']['coefs_neg'][col_i] = min(root_info['col']['coefs'][col_i], 0)
+
+                # Num. constraints (1)
+                #   Number of constraints that the variable participates in (with a non-zero coefficient)
+                root_info['col']['nnzrs'][col_i] = nb_neighbors
+
+                # Stats. for constraint degrees (4)
+                #   The degree of a constraint is the number of variables that participate in it. A variable may
+                #   participate in multiple constraints, and statistics over those constraints鈥?degrees are used.
+                #   The constraint degree is computed on the root LP (mean, stdev., min, max)
+                cdeg_var, cdeg_mean, cdeg_min, cdeg_max = 0, 0, 0, 0
+                if nb_neighbors > 0:
+                    for neighbor_index in range(nb_neighbors):
+                        cdeg = SCIProwGetNNonz(neighbors[neighbor_index])
+                        cdeg_mean += cdeg
+                        cdeg_max = cdeg if neighbor_index == 0 else max(cdeg_max, cdeg)
+                        cdeg_min = cdeg if neighbor_index == 0 else min(cdeg_min, cdeg)
+                    cdeg_mean /= nb_neighbors
+                    for neighbor_index in range(nb_neighbors):
+                        cdeg = SCIProwGetNNonz(neighbors[neighbor_index])
+                        cdeg_var += (cdeg - cdeg_mean)**2
+                    cdeg_var /= nb_neighbors
+                root_info['col']['root_cdeg_mean'][col_i] = cdeg_mean
+                root_info['col']['root_cdeg_var'][col_i] = cdeg_var
+                root_info['col']['root_cdeg_min'][col_i] = cdeg_min
+                root_info['col']['root_cdeg_max'][col_i] = cdeg_max
+
+                # Stats. for constraint coeffs. (10)
+                #   A variable鈥檚 positive (negative) coefficients in the constraints it participates in
+                #   (count, mean, stdev., min, max)
+                pcoefs_var, pcoefs_mean, pcoefs_min, pcoefs_max = 0, 0, 0, 0.
+                ncoefs_var, ncoefs_mean, ncoefs_min, ncoefs_max = 0, 0, 0, 0.
+                pcoefs_count, ncoefs_count = 0, 0
+                for neighbor_index in range(nb_neighbors):
+                    coef = nonzero_coefs_raw[neighbor_index]
+                    if coef > 0:
+                        pcoefs_count += 1
+                        pcoefs_mean += coef
+                        pcoefs_min = coef if pcoefs_count == 1 else min(pcoefs_min, coef)
+                        pcoefs_max = coef if pcoefs_count == 1 else max(pcoefs_max, coef)
+                    if coef < 0:
+                        ncoefs_count += 1
+                        ncoefs_mean += coef
+                        ncoefs_min = coef if ncoefs_count == 1 else min(ncoefs_min, coef)
+                        ncoefs_max = coef if ncoefs_count == 1 else max(ncoefs_max, coef)
+                if pcoefs_count > 0:
+                    pcoefs_mean /= pcoefs_count
+                if ncoefs_count > 0:
+                    ncoefs_mean /= ncoefs_count
+                for neighbor_index in range(nb_neighbors):
+                    coef = nonzero_coefs_raw[neighbor_index]
+                    if coef > 0:
+                        pcoefs_var += (coef - pcoefs_mean)**2
+                    if coef < 0:
+                        ncoefs_var += (coef - ncoefs_mean)**2
+                if pcoefs_count > 0:
+                    pcoefs_var /= pcoefs_count
+                if ncoefs_count > 0:
+                    ncoefs_var /= ncoefs_count
+                root_info['col']['root_pcoefs_count'][col_i] = pcoefs_count
+                root_info['col']['root_pcoefs_mean'][col_i]  = pcoefs_mean
+                root_info['col']['root_pcoefs_var'][col_i]   = pcoefs_var
+                root_info['col']['root_pcoefs_min'][col_i]   = pcoefs_min
+                root_info['col']['root_pcoefs_max'][col_i]   = pcoefs_max
+                root_info['col']['root_ncoefs_count'][col_i] = ncoefs_count
+                root_info['col']['root_ncoefs_mean'][col_i]  = ncoefs_mean
+                root_info['col']['root_ncoefs_var'][col_i]   = ncoefs_var
+                root_info['col']['root_ncoefs_min'][col_i]   = ncoefs_min
+                root_info['col']['root_ncoefs_max'][col_i]   = ncoefs_max
+
+        for cand_i in range(ncands):
+            var = (<Variable>candidates[cand_i]).scip_var
+            col = SCIPvarGetCol(var)
+            col_i = SCIPcolGetIndex(col)
+            cand_coefs[cand_i]             = root_info['col']['coefs'][col_i]
+            cand_coefs_pos[cand_i]         = root_info['col']['coefs_pos'][col_i]
+            cand_coefs_neg[cand_i]         = root_info['col']['coefs_neg'][col_i]
+            cand_nnzrs[cand_i]             = root_info['col']['nnzrs'][col_i]
+            cand_root_cdeg_mean[cand_i]    = root_info['col']['root_cdeg_mean'][col_i]
+            cand_root_cdeg_var[cand_i]     = root_info['col']['root_cdeg_var'][col_i]
+            cand_root_cdeg_min[cand_i]     = root_info['col']['root_cdeg_min'][col_i]
+            cand_root_cdeg_max[cand_i]     = root_info['col']['root_cdeg_max'][col_i]
+            cand_root_pcoefs_count[cand_i] = root_info['col']['root_pcoefs_count'][col_i]
+            cand_root_pcoefs_mean[cand_i]  = root_info['col']['root_pcoefs_mean'][col_i]
+            cand_root_pcoefs_var[cand_i]   = root_info['col']['root_pcoefs_var'][col_i]
+            cand_root_pcoefs_min[cand_i]   = root_info['col']['root_pcoefs_min'][col_i]
+            cand_root_pcoefs_max[cand_i]   = root_info['col']['root_pcoefs_max'][col_i]
+            cand_root_ncoefs_count[cand_i] = root_info['col']['root_ncoefs_count'][col_i]
+            cand_root_ncoefs_mean[cand_i]  = root_info['col']['root_ncoefs_mean'][col_i]
+            cand_root_ncoefs_var[cand_i]   = root_info['col']['root_ncoefs_var'][col_i]
+            cand_root_ncoefs_min[cand_i]   = root_info['col']['root_ncoefs_min'][col_i]
+            cand_root_ncoefs_max[cand_i]   = root_info['col']['root_ncoefs_max'][col_i]
+
+        # Simple dynamic
+        # --------------
+        cdef float solval
+        cdef int nbranchings
+        for cand_i in range(ncands):
+            var = (<Variable>candidates[cand_i]).scip_var
+            col = SCIPvarGetCol(var)
+            neighbors = SCIPcolGetRows(col)
+            nb_neighbors = SCIPcolGetNNonz(col)
+            nonzero_coefs_raw = SCIPcolGetVals(col)
+
+            # Slack and ceil distances (2)
+            #   min{xij鈭抐loor(xij),ceil(xij) 鈭抶ij} and ceil(xij) 鈭抶ij
+            solval = SCIPcolGetPrimsol(col)
+            cand_solfracs[cand_i] = SCIPfeasFrac(scip, solval)
+            cand_slack[cand_i] = min(cand_solfracs[cand_i], 1-cand_solfracs[cand_i])
+
+            # Pseudocosts (5)
+            #   Upwards and downwards values, and their corresponding ratio, sum and product,
+            #   weighted by the fractionality of xj
+            cand_ps_up[cand_i] = SCIPgetVarPseudocost(scip, var, SCIP_BRANCHDIR_UPWARDS)
+            cand_ps_down[cand_i] = SCIPgetVarPseudocost(scip, var, SCIP_BRANCHDIR_DOWNWARDS)
+            cand_ps_sum[cand_i] = cand_ps_up[cand_i] + cand_ps_down[cand_i]
+            cand_ps_ratio[cand_i] = 0 if cand_ps_up[cand_i] == 0 else cand_ps_up[cand_i] / cand_ps_sum[cand_i]
+            cand_ps_product[cand_i] = cand_ps_up[cand_i] * cand_ps_down[cand_i]
+
+            # Infeasibility statistics (4)
+            #   Number and fraction of nodes for which applying SB to variable xj led to one (two)
+            #   infeasible children (during data collection)
+            # N.B. replaced by left, right infeasibility
+            cand_nb_up_infeas[cand_i]   = SCIPvarGetCutoffSum(var, SCIP_BRANCHDIR_UPWARDS)
+            cand_nb_down_infeas[cand_i] = SCIPvarGetCutoffSum(var, SCIP_BRANCHDIR_DOWNWARDS)
+            nbranchings = SCIPvarGetNBranchings(var, SCIP_BRANCHDIR_UPWARDS)
+            cand_frac_up_infeas[cand_i]   = 0 if nbranchings == 0 else cand_nb_up_infeas[cand_i] / nbranchings
+            nbranchings = SCIPvarGetNBranchings(var, SCIP_BRANCHDIR_DOWNWARDS)
+            cand_frac_down_infeas[cand_i] = 0 if nbranchings == 0 else cand_nb_down_infeas[cand_i] / nbranchings
+
+
+
+        return {
+            'coefs':                cand_coefs,
+            'coefs_pos':            cand_coefs_pos,
+            'coefs_neg':            cand_coefs_neg,
+            'nnzrs':                cand_nnzrs,
+            'root_cdeg_mean':       cand_root_cdeg_mean,
+            'root_cdeg_var':        cand_root_cdeg_var,
+            'root_cdeg_min':        cand_root_cdeg_min,
+            'root_cdeg_max':        cand_root_cdeg_max,
+            'root_pcoefs_count':    cand_root_pcoefs_count,
+            'root_pcoefs_mean':     cand_root_pcoefs_mean,
+            'root_pcoefs_var':      cand_root_pcoefs_var,
+            'root_pcoefs_min':      cand_root_pcoefs_min,
+            'root_pcoefs_max':      cand_root_pcoefs_max,
+            'root_ncoefs_count':    cand_root_ncoefs_count,
+            'root_ncoefs_mean':     cand_root_ncoefs_mean,
+            'root_ncoefs_var':      cand_root_ncoefs_var,
+            'root_ncoefs_min':      cand_root_ncoefs_min,
+            'root_ncoefs_max':      cand_root_ncoefs_max,
+            'solfracs':             cand_solfracs,
+            'slack':                cand_slack,
+            'ps_up':                cand_ps_up,
+            'ps_down':              cand_ps_down,
+            'ps_ratio':             cand_ps_ratio,
+            'ps_sum':               cand_ps_sum,
+            'ps_product':           cand_ps_product,
+            'nb_up_infeas':         cand_nb_up_infeas,
+            'nb_down_infeas':       cand_nb_down_infeas,
+            'frac_up_infeas':       cand_frac_up_infeas,
+            'frac_down_infeas':     cand_frac_down_infeas,
+        }
+
+
+
+
+
     def getSolvingStats(self):
         cdef SCIP* scip = self._scip
 
@@ -4888,7 +5325,7 @@ cdef class Model:
         cdef np.float_t dualbound = SCIPgetDualbound(scip)
 
         # record open node quantiles
-        cdef np.ndarray[np.float_t, ndim=1] lowerbounds = np.empty([nleaves+nchildren+nsiblings+1], dtype=np.float)
+        cdef np.ndarray[np.float_t, ndim=1] lowerbounds = np.empty([nleaves+nchildren+nsiblings+1], dtype=np.double)
 
         lowerbounds[0] = dualbound
         for i in range(nleaves):
@@ -4900,6 +5337,8 @@ cdef class Model:
 
         percentiles = (10, 25, 50, 75, 90)
         qs = np.percentile(lowerbounds, percentiles, overwrite_input=True, interpolation='linear')
+
+        branchdecisiontime = SCIPGetBranchDecisionTime(scip) if (SCIPfindBranchrule(scip, "symb".encode("UTF-8")) != NULL) else 0.
 
         return {
 
@@ -4916,6 +5355,7 @@ cdef class Model:
             'ncreatednodesrun': scip.stat.ncreatednodesrun,
             'nactivatednodes': scip.stat.nactivatednodes,
             'ndeactivatednodes': scip.stat.ndeactivatednodes,
+            'primaldualintegral': scip.stat.primaldualintegral,
 
             # http://scip.zib.de/doc/html/group__PublicLPMethods.php
 
@@ -5026,6 +5466,7 @@ cdef class Model:
             'avgcuroffscorecurrentrun': SCIPgetAvgCutoffScoreCurrentRun(scip),
             'deterministictime': SCIPgetDeterministicTime(scip),  # gets deterministic time number of LPs solved so far
             'solvingtime': SCIPgetSolvingTime(scip),
+            "branchdecisiontime": branchdecisiontime
         }
 
     def executeBranchRule(self, str name, allowaddcons):

@@ -2004,3 +2004,8 @@ cdef extern from "scip/branch_vanillafullstrong.h":
                                               int* ncands,
                                               int* npriocands,
                                               int* bestcand)
+
+cdef extern from "scip/branch_symb.h":
+    SCIP_RETCODE SCIPincludeBranchruleSymb(SCIP* scip, const char* loadpath)
+    SCIP_Real SCIPGetBranchDecisionTime(SCIP* scip)
+    SCIP_RETCODE getSymbBestCands(SCIP* scip, SCIP_BRANCHRULE* branchrule, SCIP_VAR ***goodcands_ptr, int* ngoodcands)

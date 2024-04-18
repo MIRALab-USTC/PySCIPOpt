@@ -1,5 +1,10 @@
+## Revised PySCIPOpt for Symb4CO
+
+This code is revised from [learn2branching](https://github.com/ds4dm/PySCIPOpt/tree/ml-branching), which is used for Symb4CO in ICLR 2024 [[paper]](https://openreview.net/forum?id=jKhNBulNMh&referrer=%5BAuthor%20Console%5D(%2Fgroup%3Fid%3DICLR.cc%2F2024%2FConference%2FAuthors%23your-submissions)). Please refer to the last git commit to identify what has been revised.
+
 PySCIPOpt
 =========
+
 
 This project provides an interface from Python to the [SCIP Optimization
 Suite](http://scip.zib.de).
